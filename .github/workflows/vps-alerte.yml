@@ -1,0 +1,238 @@
+# Alerte VPS-1 OVH sous Linux à Gravelines (GRA) et Strasbourg (SBG)
+#
+# Toutes les 5 minutes, lit https://vps-in-stock.ovh/ et envoie une notification
+# sur ton portable (application ntfy) dès qu'un VPS-1 Linux est en stock à GRA ou SBG.
+#
+# À placer dans le dépôt GitHub sous : .github/workflows/vps-alerte.yml
+# Secret à créer dans le dépôt : NTFY_TOPIC (le nom de ton sujet ntfy)
+
+name: Alerte VPS-1 Linux GRA-SBG
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Envoyer une notification de test sur le portable"
+        type: boolean
+        default: true
+
+concurrency:
+  group: vps-alerte
+  cancel-in-progress: true
+
+jobs:
+  verifier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Vérifier le stock et notifier
+        shell: python3 -u {0}
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TEST_NOTIFICATION: ${{ inputs.test }}
+        run: |
+          import json, os, re, sys, time
+          import urllib.error, urllib.parse, urllib.request
+          from html.parser import HTMLParser
+
+          # ---------- Réglages ----------
+          SITE_URL = "https://vps-in-stock.ovh/"
+          PLAN_CODE = "vps-2027-model1"          # VPS-1 (pas la version "LZ")
+          DATACENTERS = {"GRA": "eu-west-gra", "SBG": "eu-west-sbg"}
+          ORDER_URL = ("https://www.ovhcloud.com/fr/vps/configurator/"
+                       "?os=option-linux&planCode=" + PLAN_CODE)
+          RAPPEL_APRES = "30m"   # pas de nouvelle alerte pour un même datacenter pendant 30 min
+          NTFY_SERVER = "https://ntfy.sh"
+          UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
+
+          TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
+          TEST = os.environ.get("TEST_NOTIFICATION", "").strip().lower() == "true"
+
+
+          class SiteError(Exception):
+              def __init__(self, msg, persistante):
+                  super().__init__(msg)
+                  self.persistante = persistante   # True = le site bloque ou a changé
+
+
+          # ---------- Lecture de la page ----------
+          def lire_page():
+              derniere = None
+              for essai in range(3):
+                  try:
+                      req = urllib.request.Request(SITE_URL, headers={
+                          "User-Agent": UA, "Accept": "text/html", "Cache-Control": "no-cache"})
+                      with urllib.request.urlopen(req, timeout=30) as r:
+                          return r.read().decode("utf-8", errors="replace")
+                  except urllib.error.HTTPError as e:
+                      derniere = e
+                      if 400 <= e.code < 500:
+                          raise SiteError(f"le site refuse l'accès (HTTP {e.code})", True)
+                  except Exception as e:
+                      derniere = e
+                  time.sleep(5)
+              raise SiteError(f"site injoignable ({derniere})", False)
+
+
+          class Tableaux(HTMLParser):
+              """Récupère chaque <table> avec le texte qui la précède (titre de section)."""
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.tables, self.texte_avant = [], []
+                  self.prof, self.cur, self.ligne, self.cellule = 0, None, None, None
+
+              def _fin_cellule(self):
+                  if self.cellule is not None and self.ligne is not None:
+                      self.ligne.append(" ".join(" ".join(self.cellule).split()))
+                  self.cellule = None
+
+              def _fin_ligne(self):
+                  self._fin_cellule()
+                  if self.ligne:
+                      self.cur["lignes"].append(self.ligne)
+                  self.ligne = None
+
+              def handle_starttag(self, tag, attrs):
+                  if tag == "table":
+                      self.prof += 1
+                      if self.prof == 1:
+                          self.cur = {"contexte": " ".join(self.texte_avant), "lignes": []}
+                  elif self.prof == 1 and tag == "tr":
+                      self._fin_ligne()
+                      self.ligne = []
+                  elif self.prof == 1 and tag in ("td", "th") and self.ligne is not None:
+                      self._fin_cellule()
+                      self.cellule = []
+
+              def handle_endtag(self, tag):
+                  if tag == "table" and self.prof:
+                      if self.prof == 1:
+                          self._fin_ligne()
+                          self.tables.append(self.cur)
+                          self.cur, self.texte_avant = None, []
+                      self.prof -= 1
+                  elif self.prof == 1 and tag in ("td", "th"):
+                      self._fin_cellule()
+                  elif self.prof == 1 and tag == "tr":
+                      self._fin_ligne()
+
+              def handle_data(self, data):
+                  if self.prof == 0:
+                      self.texte_avant.append(data)
+                  elif self.cellule is not None:
+                      self.cellule.append(data)
+
+
+          MODELE_RE = re.compile(r"vps-\d{4}-model\d+(?:\.lz)?", re.I)
+
+          def statuts_linux(html):
+              p = Tableaux()
+              p.feed(html)
+              p.close()
+              for t in p.tables:
+                  # Le tableau appartient au dernier code de modèle cité avant lui (son titre).
+                  codes = MODELE_RE.findall(t["contexte"])
+                  if not codes or codes[-1].lower() != PLAN_CODE.lower():
+                      continue
+                  lignes = t["lignes"]
+                  entete = next((l for l in lignes if any("linux" in c.lower() for c in l)), None)
+                  if entete is None:
+                      continue
+                  bas = [c.lower() for c in entete]
+                  i_linux = next(i for i, c in enumerate(bas) if "linux" in c)
+                  i_dc = next((i for i, c in enumerate(bas) if "datacenter" in c), 0)
+                  statuts = {}
+                  for l in lignes:
+                      if l is entete or len(l) <= i_linux:
+                          continue
+                      cellules = [c.lower() for c in l]
+                      for nom, code in DATACENTERS.items():
+                          if code in cellules or (i_dc < len(l) and l[i_dc].strip().upper() == nom):
+                              statuts[nom] = l[i_linux]
+                  return statuts
+              raise SiteError("tableau VPS-1 introuvable sur la page (le site a peut-être changé)", True)
+
+
+          # ---------- Notifications ntfy ----------
+          def notifier(titre, message, priorite=3, tags=None, liens=True):
+              corps = {"topic": TOPIC, "title": titre, "message": message,
+                       "priority": priorite, "tags": tags or []}
+              if liens:
+                  corps["click"] = ORDER_URL
+                  corps["actions"] = [
+                      {"action": "view", "label": "Commander", "url": ORDER_URL, "clear": True},
+                      {"action": "view", "label": "Voir le stock", "url": SITE_URL},
+                  ]
+              req = urllib.request.Request(
+                  NTFY_SERVER, data=json.dumps(corps).encode("utf-8"),
+                  headers={"Content-Type": "application/json"}, method="POST")
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  r.read()
+
+
+          def deja_envoye(tag, depuis):
+              """Regarde sur ntfy si une alerte portant ce tag a été envoyée récemment."""
+              url = (f"{NTFY_SERVER}/{urllib.parse.quote(TOPIC, safe='')}/json"
+                     f"?poll=1&since={depuis}&tags={urllib.parse.quote(tag, safe='')}")
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": UA})
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      for ligne in r.read().decode("utf-8").splitlines():
+                          if ligne.strip() and json.loads(ligne).get("event") == "message":
+                              return True
+              except Exception as e:
+                  print(f"(impossible de vérifier les alertes déjà envoyées : {e})")
+              return False
+
+
+          # ---------- Programme ----------
+          def main():
+              if not TOPIC:
+                  sys.exit("Secret NTFY_TOPIC manquant : ajoute-le dans "
+                           "Settings > Secrets and variables > Actions.")
+              try:
+                  statuts = statuts_linux(lire_page())
+              except SiteError as e:
+                  print(f"ERREUR : {e}")
+                  if TEST:
+                      notifier("⚠️ Test : lecture du site impossible", str(e),
+                               tags=["warning"], liens=False)
+                  elif e.persistante and not deja_envoye("vps-erreur", "12h"):
+                      notifier("⚠️ Alerte VPS en panne",
+                               f"Problème : {e}. Les alertes ne fonctionnent plus pour l'instant.",
+                               tags=["warning", "vps-erreur"], liens=False)
+                  return
+
+              resume = ", ".join(f"{dc} : {statuts.get(dc, 'absent')}" for dc in DATACENTERS)
+              print("Statut Linux du VPS-1 ->", resume)
+
+              if TEST:
+                  notifier("✅ Test réussi",
+                           f"Les alertes fonctionnent.\nStatut actuel (Linux) — {resume}",
+                           tags=["white_check_mark"], liens=False)
+                  print("Notification de test envoyée.")
+                  return
+
+              dispo = [dc for dc in DATACENTERS
+                       if statuts.get(dc, "").strip().lower().startswith("available")]
+              if not dispo:
+                  return
+
+              nouveaux = [dc for dc in dispo if not deja_envoye(f"vps-{dc.lower()}", RAPPEL_APRES)]
+              if not nouveaux:
+                  print(f"Déjà signalé il y a moins de {RAPPEL_APRES}, pas de nouvelle alerte.")
+                  return
+
+              ou = " et ".join(dispo)
+              notifier(f"🟢 VPS-1 dispo à {ou} (Linux)",
+                       "Commande vite, le stock part souvent en quelques minutes.\n"
+                       f"Dans le configurateur, choisis {ou}.",
+                       priorite=5,
+                       tags=["rotating_light"] + [f"vps-{dc.lower()}" for dc in dispo])
+              print(f"Notification envoyée : {ou}")
+
+
+          main()
