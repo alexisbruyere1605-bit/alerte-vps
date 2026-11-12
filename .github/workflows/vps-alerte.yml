@@ -1,7 +1,9 @@
 # Alerte VPS-1 OVH sous Linux à Gravelines (GRA) et Strasbourg (SBG)
 #
-# Toutes les 5 minutes, lit https://vps-in-stock.ovh/ et envoie une notification
-# sur ton portable (application ntfy) dès qu'un VPS-1 Linux est en stock à GRA ou SBG.
+# Toutes les 5 minutes, interroge directement l'API publique d'OVH (la même source que
+# https://vps-in-stock.ovh/, qui sert de secours si l'API ne répond pas) et envoie une
+# notification sur ton portable (application ntfy) dès qu'un VPS-1 Linux est en stock
+# à GRA ou SBG.
 #
 # À placer dans le dépôt GitHub sous : .github/workflows/vps-alerte.yml
 # Secret à créer dans le dépôt : NTFY_TOPIC (le nom de ton sujet ntfy)
@@ -38,8 +40,11 @@ jobs:
           from html.parser import HTMLParser
 
           # ---------- Réglages ----------
-          SITE_URL = "https://vps-in-stock.ovh/"
           PLAN_CODE = "vps-2027-model1"          # VPS-1 (pas la version "LZ")
+          FILIALE = "FR"                          # stock vu depuis OVH France
+          API_URL = ("https://eu.api.ovh.com/v1/vps/order/rule/datacenter"
+                     f"?ovhSubsidiary={FILIALE}&planCode={PLAN_CODE}")
+          SITE_URL = "https://vps-in-stock.ovh/"  # secours si l'API ne répond pas
           DATACENTERS = {"GRA": "eu-west-gra", "SBG": "eu-west-sbg"}
           ORDER_URL = ("https://www.ovhcloud.com/fr/vps/configurator/"
                        "?os=option-linux&planCode=" + PLAN_CODE)
@@ -58,7 +63,31 @@ jobs:
                   self.persistante = persistante   # True = le site bloque ou a changé
 
 
-          # ---------- Lecture de la page ----------
+          # ---------- Source 1 : API publique OVH ----------
+          def statuts_api():
+              req = urllib.request.Request(API_URL, headers={
+                  "User-Agent": UA, "Accept": "application/json"})
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  donnees = json.loads(r.read().decode("utf-8"))
+              # Réponse attendue : {"datacenters": [{"datacenter": "GRA", "code": "eu-west-gra",
+              #   "status": ..., "linuxStatus": ..., "windowsStatus": ...}, ...]}
+              entrees = donnees
+              if isinstance(donnees, dict):
+                  entrees = next((v for v in donnees.values() if isinstance(v, list)), [])
+              entrees = [e for e in entrees if isinstance(e, dict)]
+              statuts = {}
+              for e in entrees:
+                  code = str(e.get("code", "")).lower()
+                  dc = str(e.get("datacenter", "")).upper()
+                  for nom, code_dc in DATACENTERS.items():
+                      if (code == code_dc or dc == nom) and "linuxStatus" in e:
+                          statuts[nom] = str(e["linuxStatus"])
+              if not statuts:
+                  raise ValueError(f"format de réponse inattendu : {str(donnees)[:200]}")
+              return statuts
+
+
+          # ---------- Source 2 (secours) : page vps-in-stock.ovh ----------
           def lire_page():
               derniere = None
               for essai in range(3):
@@ -193,25 +222,35 @@ jobs:
               if not TOPIC:
                   sys.exit("Secret NTFY_TOPIC manquant : ajoute-le dans "
                            "Settings > Secrets and variables > Actions.")
+              statuts, source, erreur = None, None, None
               try:
-                  statuts = statuts_linux(lire_page())
-              except SiteError as e:
-                  print(f"ERREUR : {e}")
+                  statuts, source = statuts_api(), "API OVH"
+              except Exception as e_api:
+                  print(f"API OVH indisponible ({e_api}), passage par vps-in-stock.ovh")
+                  try:
+                      statuts, source = statuts_linux(lire_page()), "vps-in-stock.ovh (secours)"
+                  except SiteError as e_site:
+                      erreur = SiteError(f"API OVH : {e_api} / vps-in-stock.ovh : {e_site}",
+                                         e_site.persistante)
+
+              if erreur:
+                  print(f"ERREUR : {erreur}")
                   if TEST:
-                      notifier("⚠️ Test : lecture du site impossible", str(e),
+                      notifier("⚠️ Test : lecture du stock impossible", str(erreur),
                                tags=["warning"], liens=False)
-                  elif e.persistante and not deja_envoye("vps-erreur", "12h"):
+                  elif erreur.persistante and not deja_envoye("vps-erreur", "12h"):
                       notifier("⚠️ Alerte VPS en panne",
-                               f"Problème : {e}. Les alertes ne fonctionnent plus pour l'instant.",
+                               f"Problème : {erreur}. Les alertes ne fonctionnent plus pour l'instant.",
                                tags=["warning", "vps-erreur"], liens=False)
                   return
 
               resume = ", ".join(f"{dc} : {statuts.get(dc, 'absent')}" for dc in DATACENTERS)
-              print("Statut Linux du VPS-1 ->", resume)
+              print(f"Statut Linux du VPS-1 (source : {source}) ->", resume)
 
               if TEST:
                   notifier("✅ Test réussi",
-                           f"Les alertes fonctionnent.\nStatut actuel (Linux) — {resume}",
+                           f"Les alertes fonctionnent.\nSource : {source}\n"
+                           f"Statut actuel (Linux) — {resume}",
                            tags=["white_check_mark"], liens=False)
                   print("Notification de test envoyée.")
                   return
